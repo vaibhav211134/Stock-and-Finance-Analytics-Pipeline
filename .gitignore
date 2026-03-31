@@ -1,0 +1,22 @@
+# 1. SECURITY: Block BigQuery/GCP credentials (VITAL)
+gcp_key.json
+*.json
+
+# 2. DATA PRIVACY: Block all Shop/Family Business Data
+# This prevents your Excel and CSV files from going public
+raw_data/
+clean_data/
+*.xlsx
+*.csv
+
+# 3. ENVIRONMENT: Block Python and System files
+venv/
+.env
+__pycache__/
+.DS_Store
+
+# 4. DBT SPECIFIC: Ignore logs and compiled code
+# (Recruiters only want to see your .sql models, not the logs)
+logs/
+target/
+dbt_packages/

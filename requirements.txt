@@ -1,0 +1,6 @@
+pandas
+openpyxl
+google-cloud-bigquery
+db-dtypes
+dbt-bigquery
+pandas-gbq
