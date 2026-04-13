@@ -8,7 +8,12 @@ renamed as (
 
     select
         -- identity columns
-        company_name,
+        CASE 
+            WHEN company_name = 'SITARAM SHANKAR LAL-old'  THEN 'SITARAM SHANKAR LAL'
+            WHEN company_name = 'SITARAM SHYAM SUNDER-old' THEN 'SITARAM SHYAM SUNDER'
+            WHEN company_name = 'SITARAM\'S-old'            THEN 'SITARAMS'
+            ELSE company_name
+        END AS company_name,
         stock_no,
         item_description,
         product,

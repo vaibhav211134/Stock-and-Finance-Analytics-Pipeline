@@ -1,200 +1,163 @@
--- MART ACTION BOARD — The final table for Power BI
--- Every SKU, every branch, with action tags and all key metrics
--- This is what the business owner sees on the dashboard
+-- models/final/mart_action_board_v2.sql
+-- Purpose : UPGRADED action board using real sales velocity.
+--           Power BI reads this for the "Dead Stock + Branch Performance" page.
+--
+-- FIXES APPLIED:
+--   1. Removed dependency on stg_dead_stock entirely.
+--      Reason: dead_stock export is outdated — 9,322 items in it also
+--      have real sales, making it unreliable. stg_stock_movement already
+--      provides movement_status = 'Stagnant' which is more accurate and current.
+--
+--   2. Action tag 'Liquidate' now based purely on movement data:
+--      stock sitting + zero outward movement = confirmed stagnant.
+--      No need for the old dead_stock report.
+--
+-- Action tags:
+--   Reorder              → fast mover, less than 7 days stock remaining
+--   Watch — high discount→ selling but giving away too much margin
+--   Transfer             → slow here, fast at another branch
+--   Liquidate            → zero outward movement, stock confirmed sitting
+--   Healthy              → selling well, good margin, good stock level
+--   Monitor              → has some sales but slow velocity
+--   Review               → everything else
 
 with velocity as (
 
-    -- brings in all items with velocity and supply metrics
     select * from {{ ref('int_inventory_velocity') }}
 
 ),
 
-dead_stock_scored as (
+balance as (
 
-    -- brings in dead stock scores and liquidation info
-    select
-        company_name,
-        stock_no,
-        dead_stock_score,
-        days_since_last_sold,
-        monthly_opportunity_cost,
-        liquidation_floor
-
-    from {{ ref('int_dead_stock_scored') }}
+    select * from {{ ref('stg_stock_balance') }}
 
 ),
 
-transfer_opportunities as (
+movement as (
 
-    -- brings in transfer recommendations
-    select
-        stock_no,
-        needing_branch,
-        giving_branch,
-        transfer_priority_score
-
-    from {{ ref('int_transfer_opportunities') }}
+    select * from {{ ref('stg_stock_movement') }}
 
 ),
 
--- Step 1: join velocity with dead stock scores
--- left join = keep all velocity rows, attach score if available
-enriched as (
+-- Cross-branch sales: find which branch sells each item fastest
+-- Used to identify transfer opportunities
+cross_branch_velocity as (
 
     select
-        v.company_name,
-        v.stock_no,
-        v.item_description,
-        v.product,
-        v.brand,
-        v.style,
-        v.shade,
-        v.size,
-        v.retail_price,
-        v.closing_bal_qty,
-        v.closing_bal_value,
-        v.sales_qty,
-        v.sales_value,
-        v.daily_velocity,
-        v.days_of_supply,
-        v.capital_locked,
-        v.total_days,
+        stock_no,
+        max(case when velocity_tier = 'Fast mover' then company_name end)
+                                        as fast_at_branch,
+        count(distinct company_name)    as branches_selling,
+        sum(total_units_sold)           as total_units_all_branches,
+        sum(total_revenue)              as total_revenue_all_branches
+    from velocity
+    group by stock_no
 
-        -- from dead stock scored (will be null for stockout items)
-        d.dead_stock_score,
-        d.days_since_last_sold,
-        d.monthly_opportunity_cost,
-        d.liquidation_floor,
+),
 
-        -- GROSS MARGIN % = profit margin on each item
-        -- (selling price - cost price) / selling price × 100
+action as (
+
+    select
+        -- Identity
+        b.company_name,
+        b.stock_no,
+        b.item_description,
+        b.product,
+        b.brand,
+        b.supplier_name,
+
+        -- Pricing
+        b.cost_price,
+        b.retail_price,
+        b.margin_pct,
+
+        -- Current stock (from balance report — most accurate snapshot)
+        b.closing_qty                   as stock_on_hand,
+        b.capital_locked,
+        b.retail_value                  as stock_retail_value,
+        b.stock_value_bucket,
+
+        -- Sales velocity (from real transactions)
+        v.total_units_sold,
+        v.total_revenue,
+        v.units_per_day,
+        v.velocity_tier,
+        v.avg_discount_pct,
+        v.first_sale_date,
+        v.last_sale_date,
+        v.days_with_sales,
+        v.num_bills                     as bills_containing_item,
+
+        -- Days of stock remaining at current sell rate
+        -- e.g. 30 units in stock, selling 2/day = 15 days left
         round(
-            safe_divide(
-                (v.retail_price - safe_divide(v.closing_bal_value, nullif(v.closing_bal_qty, 0))),
-                v.retail_price
-            ) * 100
-        , 2) as gross_margin_pct,
+            b.closing_qty / nullif(v.units_per_day, 0)
+        , 0)                            as days_of_stock_remaining,
 
-        -- LOST REVENUE (for stockout items only)
-        -- if out of stock, how much revenue are we losing per day?
-        -- lost revenue = daily velocity × retail price × total days out of stock
+        -- Cross-branch context
+        cb.branches_selling,
+        cb.fast_at_branch,
+        cb.total_units_all_branches,
+        cb.total_revenue_all_branches,
+
+        -- Movement data (replaces dead_stock report)
+        m.movement_status,              -- Stagnant / Fully sold / Partially sold
+        m.sell_through_pct,
+        m.inwards_qty,
+        m.outwards_qty,
+
+        -- ── ACTION TAG — based on movement + sales + stock ───────────────
         case
-            when v.closing_bal_qty = 0 and v.daily_velocity > 0
-            then round(v.daily_velocity * v.retail_price * v.total_days, 2)
-            else 0
-        end as lost_revenue_estimate
-
-    from velocity v
-    left join dead_stock_scored d
-        on v.company_name = d.company_name
-        and v.stock_no = d.stock_no
-
-),
-
--- Step 2: attach transfer opportunity info
-with_transfers as (
-
-    select
-        e.*,
-
-        -- is this branch a NEEDING branch in any transfer opportunity?
-        t_need.giving_branch      as transfer_from_branch,
-        t_need.transfer_priority_score,
-
-        -- is this branch a GIVING branch in any transfer opportunity?
-        t_give.needing_branch     as transfer_to_branch
-
-    from enriched e
-
-    -- attach where this branch needs stock
-    left join transfer_opportunities t_need
-        on e.company_name = t_need.needing_branch
-        and e.stock_no = t_need.stock_no
-
-    -- attach where this branch has excess stock
-    left join transfer_opportunities t_give
-        on e.company_name = t_give.giving_branch
-        and e.stock_no = t_give.stock_no
-
-),
-
--- Step 3: assign ACTION TAGS
--- this is the core business logic — what should we do with each item?
-final as (
-
-    select
-        *,
-
-        -- ACTION TAG logic (order matters — transfer checked before reorder)
-        case
-            -- TRANSFER: out of stock but another branch has it
-            when closing_bal_qty = 0
-             and sales_qty > 0
-             and transfer_from_branch is not null
-            then 'Transfer'
-
-            -- REORDER: out of stock, was selling, no transfer available
-            when closing_bal_qty = 0
-             and sales_qty > 0
+            -- REORDER: real sales, fast mover, stock running low
+            when v.velocity_tier = 'Fast mover'
+             and b.closing_qty <= coalesce(v.units_per_day * 7, 5)
             then 'Reorder'
 
-            -- LIQUIDATE: has stock, zero sales
-            when closing_bal_qty > 0
-             and sales_qty = 0
+            -- WATCH: selling but giving heavy discounts — margin leakage
+            when v.total_units_sold > 0
+             and coalesce(v.avg_discount_pct, 0) > 15
+            then 'Watch — high discount'
+
+            -- TRANSFER: slow/no sales here, but another branch sells it fast
+            when coalesce(v.velocity_tier, 'No sales') in ('Slow mover', 'No sales')
+             and b.closing_qty > 0
+             and cb.fast_at_branch is not null
+             and cb.fast_at_branch != b.company_name
+            then 'Transfer'
+
+            -- LIQUIDATE: zero outward movement confirmed by movement report
+            -- Does NOT rely on old dead_stock export
+            when (v.total_units_sold is null or v.total_units_sold = 0)
+             and b.closing_qty > 0
+             and m.movement_status = 'Stagnant'
             then 'Liquidate'
 
-            -- HEALTHY: has stock and is selling
-            when closing_bal_qty > 0
-             and sales_qty > 0
+            -- HEALTHY: selling well, good margin, enough stock (>7 days)
+            when v.velocity_tier in ('Fast mover', 'Medium mover')
+             and b.margin_pct >= 20
+             and b.closing_qty > coalesce(v.units_per_day * 7, 0)
             then 'Healthy'
 
-            -- fallback for any edge case
+            -- MONITOR: has sales but slow velocity
+            when v.total_units_sold > 0
+            then 'Monitor'
+
+            -- REVIEW: in stock but no movement data at all
             else 'Review'
 
-        end as action_tag,
+        end                             as action_tag
 
-        -- ACTION PRIORITY (for sorting in Power BI)
-        -- 1 = most urgent, 4 = least urgent
-        case
-            when closing_bal_qty = 0 and sales_qty > 0 and transfer_from_branch is not null then 1
-            when closing_bal_qty = 0 and sales_qty > 0 then 1
-            when closing_bal_qty > 0 and sales_qty = 0 then 2
-            when closing_bal_qty > 0 and sales_qty > 0 then 4
-            else 3
-        end as action_priority,
-
-
-        -- REPORT DATE — when was this data generated
-        current_date() as report_date,
-
-        -- BRANCH TYPE — classify each branch
-        case
-            when company_name = 'SITARAM AND SONS -HO'        
-            then 'Head Office'
-            when company_name in (
-                'SITARAM AND SONS',
-                'SITARAMS',
-                'SITARAM SHANKAR LAL',
-                'SITARAM SHYAM SUNDER'
-            )                                                  
-            then 'Active Branch'
-            else 'Inactive'
-        end as branch_type,
-
-        -- IS ACTIVE — simple true/false for easy filtering in Power BI
-        case
-            when company_name in (
-                'SITARAM AND SONS -HO',
-                'SITARAM AND SONS',
-                'SITARAMS',
-                'SITARAM SHANKAR LAL',
-                'SITARAM SHYAM SUNDER'
-            ) then true
-            else false
-        end as is_active
-
-    from with_transfers
+    from balance b
+    left join velocity v
+        on  b.stock_no     = v.stock_no
+        and b.company_name = v.company_name
+    left join movement m
+        on  b.stock_no     = m.stock_no
+        and b.company_name = m.company_name
+    left join cross_branch_velocity cb
+        on  b.stock_no     = cb.stock_no
 
 )
 
-select * from final
+select * from action
+order by capital_locked desc

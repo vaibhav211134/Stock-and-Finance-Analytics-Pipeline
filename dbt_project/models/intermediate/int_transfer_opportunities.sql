@@ -1,86 +1,79 @@
--- This model finds items where one branch is out of stock
--- but another branch has excess stock of the same item
--- Instead of reordering from supplier, just transfer between branches!
+-- models/intermediate/int_transfer_opportunities.sql
+-- Purpose: Find items that are slow/stagnant at one branch
+--          but sell well at another branch — transfer candidates.
+--          Uses stg_stock_movement (closing_qty, not closing_bal_qty)
+--          and int_inventory_velocity for sales velocity.
 
-with velocity as (
+with movement as (
+
+    select * from {{ ref('stg_stock_movement') }}
+
+),
+
+velocity as (
 
     select * from {{ ref('int_inventory_velocity') }}
 
 ),
 
--- Step 1: find branches that are OUT OF STOCK for each item
--- these are the branches that NEED stock
-needing_stock as (
+-- Items that are stagnant at a branch (no outward movement)
+stagnant as (
 
     select
+        company_name,
         stock_no,
         item_description,
         product,
         brand,
-        style,
-        shade,
-        size,
-        retail_price,
-        company_name          as needing_branch,   -- this branch needs stock
-        sales_qty,                                  -- proof that it was selling
-        daily_velocity                              -- how fast it sells
-
-    from velocity
-    where closing_bal_qty = 0    -- out of stock
-    and sales_qty > 0            -- but was actually selling (real demand exists)
+        closing_qty         as qty_available,
+        capital_locked,
+        movement_status
+    from movement
+    where movement_status = 'Stagnant'
+      and closing_qty > 0
 
 ),
 
--- Step 2: find branches that have EXCESS STOCK of the same item
--- these are the branches that CAN GIVE stock
-having_stock as (
+-- Items that sell fast at some branch
+fast_movers as (
 
     select
         stock_no,
-        company_name          as giving_branch,    -- this branch can give stock
-        closing_bal_qty       as available_qty,    -- how much they have
-        capital_locked                             -- value of that stock
-
+        company_name        as sells_fast_at,
+        velocity_tier,
+        units_per_day,
+        total_units_sold
     from velocity
-    where closing_bal_qty > 2    -- has meaningful stock (more than 2 pieces)
-    and sales_qty = 0            -- and it is NOT selling there (dead stock there)
+    where velocity_tier = 'Fast mover'
 
 ),
 
--- Step 3: join them together
--- same stock_no, different branches
+-- Match: stagnant at branch A, fast mover at branch B
 opportunities as (
 
     select
-        n.stock_no,
-        n.item_description,
-        n.product,
-        n.brand,
-        n.style,
-        n.shade,
-        n.size,
-        n.retail_price,
-        n.needing_branch,         -- branch that needs stock
-        h.giving_branch,          -- branch that has excess
-        h.available_qty,          -- how many pieces can be transferred
-        n.daily_velocity,         -- how fast it sells at needing branch
-        h.capital_locked,         -- value being unlocked by transfer
+        s.company_name          as from_branch,
+        f.sells_fast_at         as to_branch,
+        s.stock_no,
+        s.item_description,
+        s.product,
+        s.brand,
+        s.qty_available,
+        s.capital_locked,
+        f.units_per_day         as velocity_at_destination,
+        f.total_units_sold      as total_sold_at_destination,
 
-        -- TRANSFER PRIORITY SCORE
-        -- high velocity at needing branch + high capital locked at giving branch
-        -- = very high priority transfer
+        -- Estimated days to sell if transferred
         round(
-            (n.daily_velocity * 100)   -- velocity component
-            +
-            (h.capital_locked / 1000)  -- capital component
-        , 2) as transfer_priority_score
+            s.qty_available / nullif(f.units_per_day, 0)
+        , 0)                    as est_days_to_sell_if_transferred
 
-    from needing_stock n
-    inner join having_stock h
-        on n.stock_no = h.stock_no          -- same item
-        and n.needing_branch != h.giving_branch  -- different branches
+    from stagnant s
+    join fast_movers f
+        on  s.stock_no     = f.stock_no
+        and s.company_name != f.sells_fast_at   -- different branch
 
 )
 
 select * from opportunities
-order by transfer_priority_score desc   -- highest priority transfers first
+order by capital_locked desc

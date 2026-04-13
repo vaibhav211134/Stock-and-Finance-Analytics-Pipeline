@@ -1,139 +1,105 @@
--- MART BRANCH PERFORMANCE
--- Answers: How is each branch performing?
--- Which branch has most dead stock? Which has most stockouts?
--- Which branch is most efficient?
--- Power BI page: Branch Performance + Executive Summary
+-- models/final/mart_branch_performance.sql
+-- Purpose: Branch-level comparison — which branch is performing best?
+--          Used in Power BI Stock Dashboard — Branch Performance page.
+--
+-- FIX: Removed reference to branch_type and is_active columns
+--      which no longer exist in mart_financials after the rename.
+--      Branch classification is now derived from company_name directly.
 
-with action_board as (
+with financials as (
 
-    -- use our already built mart as the base
-    -- it has all items with tags for all branches
-    select * from {{ ref('mart_action_board') }}
-
-),
-
--- STEP 1: summarize by branch and action tag
-branch_tag_summary as (
-
-    select
-        company_name,
-        branch_type,
-        is_active,
-        action_tag,
-
-        -- count of items per tag per branch
-        count(*)                                as item_count,
-
-        -- capital locked (only relevant for Liquidate tag)
-        round(sum(capital_locked), 2)           as total_capital_locked,
-
-        -- lost revenue (only relevant for Reorder tag)
-        round(sum(lost_revenue_estimate), 2)    as total_lost_revenue,
-
-        -- total retail value at risk
-        round(sum(retail_price * closing_bal_qty), 2) as total_retail_value
-
-    from action_board
-    group by
-        company_name,
-        branch_type,
-        is_active,
-        action_tag
+    select * from {{ ref('mart_financials') }}
 
 ),
 
--- STEP 2: pivot to get one row per branch
--- each action tag becomes its own column
-branch_pivoted as (
+-- Aggregate financials to branch level (all time)
+branch_financials as (
 
     select
         company_name,
-        branch_type,
-        is_active,
 
-        -- TOTAL ITEMS per branch
-        sum(item_count)                         as total_items,
+        -- Revenue
+        sum(gross_sales)            as total_gross_sales,
+        sum(sales_returns)          as total_sales_returns,
+        sum(net_sales)              as total_net_sales,
 
-        -- LIQUIDATE metrics
-        sum(case when action_tag = 'Liquidate'
-            then item_count else 0 end)         as liquidate_count,
+        -- Expenses
+        sum(total_expenses)         as total_expenses,
+        sum(salary_expense)         as total_salary,
+        sum(shop_expense)           as total_shop_expense,
+        sum(freight_expense)        as total_freight,
 
-        sum(case when action_tag = 'Liquidate'
-            then total_capital_locked else 0 end) as total_capital_locked,
+        -- P&L
+        sum(net_pnl)                as total_net_pnl,
+        round(avg(pnl_margin_pct), 2) as avg_pnl_margin_pct,
 
-        -- REORDER metrics
-        sum(case when action_tag = 'Reorder'
-            then item_count else 0 end)         as reorder_count,
+        -- Activity
+        count(distinct voucher_date)    as active_days,
+        min(voucher_date)               as first_sale_date,
+        max(voucher_date)               as last_sale_date,
+        sum(transaction_count)          as total_transactions
 
-        sum(case when action_tag = 'Reorder'
-            then total_lost_revenue else 0 end) as total_lost_revenue,
-
-        -- TRANSFER metrics
-        sum(case when action_tag = 'Transfer'
-            then item_count else 0 end)         as transfer_count,
-
-        -- HEALTHY metrics
-        sum(case when action_tag = 'Healthy'
-            then item_count else 0 end)         as healthy_count,
-
-        -- REVIEW metrics
-        sum(case when action_tag = 'Review'
-            then item_count else 0 end)         as review_count
-
-    from branch_tag_summary
-    group by
-        company_name,
-        branch_type,
-        is_active
+    from financials
+    group by 1
 
 ),
 
--- STEP 3: calculate efficiency scores per branch
-scored as (
+-- Add derived branch classification (replaces the old branch_type column)
+final as (
 
     select
-        *,
+        company_name,
 
-        -- DEAD STOCK RATE = what % of items are dead stock
-        -- lower is better
-        round(
-            safe_divide(liquidate_count, total_items) * 100
-        , 2)                                    as dead_stock_rate_pct,
+        -- Classify branch type from name
+        case
+            when company_name = 'SITARAM AND SONS -HO' then 'Head Office'
+            else 'Retail Branch'
+        end                         as branch_type,
 
-        -- STOCKOUT RATE = what % of items are out of stock
-        -- lower is better
-        round(
-            safe_divide(reorder_count, total_items) * 100
-        , 2)                                    as stockout_rate_pct,
+        -- Active flag
+        case
+            when company_name in (
+                'SITARAM AND SONS',
+                'SITARAMS',
+                'SITARAM SHYAM SUNDER',
+                'SITARAM SHANKAR LAL',
+                'SITARAM AND SONS -HO'
+            ) then true
+            else false
+        end                         as is_active,
 
-        -- OPPORTUNITY COST = monthly cost of capital locked in dead stock
-        -- 12% annual = 1% monthly
-        round(total_capital_locked * 0.01, 2)   as monthly_opportunity_cost,
+        total_gross_sales,
+        total_sales_returns,
+        total_net_sales,
+        total_expenses,
+        total_salary,
+        total_shop_expense,
+        total_freight,
+        total_net_pnl,
+        avg_pnl_margin_pct,
+        active_days,
+        first_sale_date,
+        last_sale_date,
+        total_transactions,
 
-        -- BRANCH HEALTH SCORE = overall efficiency score (0-100)
-        -- penalize for dead stock and stockouts
-        -- higher score = healthier branch
-        round(
-            100
-            - safe_divide(liquidate_count, total_items) * 50  -- dead stock penalty
-            - safe_divide(reorder_count, total_items) * 50    -- stockout penalty
-        , 2)                                    as branch_health_score,
-
-        -- RANK branches by health score
+        -- Revenue rank across branches
         rank() over (
-            partition by branch_type
-            order by (
-                100
-                - safe_divide(liquidate_count, total_items) * 50
-                - safe_divide(reorder_count, total_items) * 50
-            ) desc
-        )                                       as branch_rank,
+            order by total_net_sales desc
+        )                           as revenue_rank,
 
-        current_date()                          as report_date
+        -- Expense ratio (expenses as % of sales)
+        round(
+            total_expenses / nullif(total_net_sales, 0) * 100
+        , 2)                        as expense_ratio_pct,
 
-    from branch_pivoted
+        -- Avg daily sales
+        round(
+            total_net_sales / nullif(active_days, 0)
+        , 2)                        as avg_daily_sales
+
+    from branch_financials
 
 )
 
-select * from scored
-order by branch_health_score desc
+select * from final
+order by total_net_sales desc

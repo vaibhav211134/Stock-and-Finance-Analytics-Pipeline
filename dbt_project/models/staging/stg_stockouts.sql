@@ -12,7 +12,12 @@ renamed as (
 
     select
         -- who and what
-        company_name,                                             -- which branch
+        CASE 
+            WHEN company_name = 'SITARAM SHANKAR LAL-old'  THEN 'SITARAM SHANKAR LAL'
+            WHEN company_name = 'SITARAM SHYAM SUNDER-old' THEN 'SITARAM SHYAM SUNDER'
+            WHEN company_name = 'SITARAM\'S-old'            THEN 'SITARAMS'
+            ELSE company_name
+        END AS company_name,
         stock_no,                                                 -- unique item code
         item_description,                                         -- item name
         product,                                                  -- product category

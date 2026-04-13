@@ -8,3 +8,8 @@ sources:
       - name: purchase
       - name: dead_stock
       - name: stockout
+      - name: ledger
+      - name: stock_balance
+      - name: stock_movement
+      - name: sales
+      - name: sales_returns

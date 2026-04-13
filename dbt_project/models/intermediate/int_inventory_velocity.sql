@@ -1,143 +1,111 @@
--- This model calculates how fast each item sells per branch
--- It combines stockout + dead_stock + healthy items for complete picture
--- Key output: daily_velocity, days_of_supply, capital_locked
+-- models/intermediate/int_inventory_velocity_v3.sql
+-- Purpose : THE definitive velocity model. Uses actual sales transactions
+--           (not purchases, not movement summaries) to calculate how fast
+--           each item sells at each branch.
+--
+--           v1 = purchase-based (old, inaccurate)
+--           v2 = movement summary outwards_qty (better)
+--           v3 = actual sales lines (most accurate — retire v1 and v2 after confirming)
+--
+-- Key metric: units_sold_per_day — the heartbeat of inventory intelligence.
 
-with purchases as (
+with sales as (
 
-    -- get the date range from purchases
-    select
-        min(voucher_date) as first_date,
-        max(voucher_date) as last_date,
-        date_diff(max(voucher_date), min(voucher_date), day) as total_days
-
-    from {{ ref('stg_purchases') }}
-
-),
-
-stockouts as (
-
-    -- items that were selling but ran out of stock
-    select
-        company_name,
-        stock_no,
-        item_description,
-        product,
-        brand,
-        style,
-        shade,
-        size,
-        retail_price,
-        closing_bal_qty,        -- will be 0 (out of stock)
-        sales_qty,              -- how many sold
-        sales_value,            -- revenue generated
-        0.0 as closing_bal_value
-
-    from {{ ref('stg_stockouts') }}
+    select * from {{ ref('stg_sales') }}
 
 ),
 
-dead_stock as (
+-- Aggregate to SKU × branch level
+sku_branch as (
 
-    -- items that have stock but nobody is buying
     select
         company_name,
         stock_no,
         item_description,
         product,
         brand,
-        style,
-        shade,
-        size,
-        retail_price,
-        closing_bal_qty,        -- stock sitting unsold
-        0 as sales_qty,         -- no sales
-        0.0 as sales_value,     -- no revenue
-        closing_bal_value       -- capital locked
 
-    from {{ ref('stg_dead_stock') }}
+        -- Volume
+        sum(sales_qty)                              as total_units_sold,
+        sum(line_revenue)                           as total_revenue,
+        sum(full_mrp_value)                         as total_mrp_value,
+        sum(discount_given)                         as total_discount,
 
-),
+        -- Time span
+        min(sale_date)                              as first_sale_date,
+        max(sale_date)                              as last_sale_date,
+        count(distinct sale_date)                   as days_with_sales,
+        count(distinct voucher_no)                  as num_bills,
 
-healthy as (
+        -- B2B split
+        sum(case when is_b2b then sales_qty else 0 end)     as b2b_units,
+        sum(case when is_b2b then line_revenue else 0 end)  as b2b_revenue,
+        sum(case when not is_b2b then sales_qty else 0 end) as retail_units,
+        sum(case when not is_b2b then line_revenue else 0 end) as retail_revenue,
 
-    -- items that have stock AND are selling
-    -- we estimate their metrics from purchase data
-    select
-        company_name,
-        stock_no,
-        item_description,
-        product,
-        brand,
-        style,
-        shade,
-        size,
-        retail_price,
+        -- Avg selling price (net_amount / qty — reflects actual discounts)
+        round(
+            sum(line_revenue) / nullif(sum(sales_qty), 0)
+        , 2)                                        as avg_selling_price,
 
-        -- we dont have exact closing qty for healthy items
-        -- using total purchased as proxy (they have stock since not in stockout)
-        total_purchase_qty      as closing_bal_qty,
+        -- Avg discount %
+        round(
+            sum(discount_given) / nullif(sum(full_mrp_value), 0) * 100
+        , 2)                                        as avg_discount_pct
 
-        -- estimate sales as portion of purchases (they are selling)
-        -- since not in stockout they have remaining stock
-        -- we use purchase qty as upper bound
-        total_purchase_qty      as sales_qty,
-
-        -- estimated sales value
-        total_purchase_value    as sales_value,
-
-        -- estimated capital locked
-        total_purchase_value    as closing_bal_value
-
-    from {{ ref('stg_healthy_items') }}
+    from sales
+    group by 1, 2, 3, 4, 5
 
 ),
 
--- stack all 3 sources together
-combined as (
-
-    select * from stockouts
-    union all
-    select * from dead_stock
-    union all
-    select * from healthy
-
-),
-
-with_velocity as (
+-- Calculate velocity (units per day over the active selling period)
+velocity as (
 
     select
-        c.company_name,
-        c.stock_no,
-        c.item_description,
-        c.product,
-        c.brand,
-        c.style,
-        c.shade,
-        c.size,
-        c.retail_price,
-        c.closing_bal_qty,
-        c.closing_bal_value,
-        c.sales_qty,
-        c.sales_value,
-        p.total_days,
+        *,
 
-        -- DAILY VELOCITY = pieces sold per day
-        round(safe_divide(c.sales_qty, p.total_days), 4) as daily_velocity,
+        -- Days the item has been in the system (first sale to today)
+        date_diff(current_date(), first_sale_date, day) as days_since_first_sale,
 
-        -- DAYS OF SUPPLY = how long current stock will last
+        -- Days between first and last sale
+        date_diff(last_sale_date, first_sale_date, day) + 1 as selling_period_days,
+
+        -- Units sold per day (over full selling period)
+        round(
+            total_units_sold /
+            nullif(date_diff(last_sale_date, first_sale_date, day) + 1, 0)
+        , 4)                                        as units_per_day,
+
+        -- Revenue per day
+        round(
+            total_revenue /
+            nullif(date_diff(last_sale_date, first_sale_date, day) + 1, 0)
+        , 2)                                        as revenue_per_day
+
+    from sku_branch
+
+),
+
+-- Assign velocity tier and reorder signals
+final as (
+
+    select
+        *,
+
+        -- Velocity tier
         case
-            when safe_divide(c.sales_qty, p.total_days) > 0
-            then round(safe_divide(c.closing_bal_qty,
-                 safe_divide(c.sales_qty, p.total_days)), 1)
-            else null
-        end as days_of_supply,
+            when units_per_day >= 1.0  then 'Fast mover'    -- sells 1+ unit/day
+            when units_per_day >= 0.1  then 'Medium mover'  -- sells 1 unit per ~10 days
+            when units_per_day >  0    then 'Slow mover'    -- sells occasionally
+            else                            'No sales'
+        end as velocity_tier,
 
-        -- CAPITAL LOCKED = money in unsold inventory
-        round(c.closing_bal_value, 2) as capital_locked
+        -- Days of stock remaining at current sell rate
+        -- (requires stock_balance — joined in mart layer)
+        null as days_of_stock_remaining   -- placeholder, joined in mart_action_board_v2
 
-    from combined c
-    cross join purchases p
+    from velocity
 
 )
 
-select * from with_velocity
+select * from final

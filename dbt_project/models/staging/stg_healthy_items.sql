@@ -13,7 +13,12 @@ dead_stock as (
 
     -- get all stock_no + company combinations that are dead stock
     select distinct
-        company_name,
+        CASE 
+            WHEN company_name = 'SITARAM SHANKAR LAL-old'  THEN 'SITARAM SHANKAR LAL'
+            WHEN company_name = 'SITARAM SHYAM SUNDER-old' THEN 'SITARAM SHYAM SUNDER'
+            WHEN company_name = 'SITARAM\'S-old'            THEN 'SITARAMS'
+            ELSE company_name
+        END AS company_name,
         stock_no
     from {{ ref('stg_dead_stock') }}
 
