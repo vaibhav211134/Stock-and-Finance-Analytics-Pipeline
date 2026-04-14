@@ -65,8 +65,8 @@ BigQuery — raw dataset
   - stockout, dead_stock, daily_sales_live
         │
         ▼
-dbt Core — 20 models
-  - Staging (views)     → 8 models
+dbt Core — 21 models
+  - Staging (views)     → 9 models
   - Intermediate (views)→ 5 models
   - Mart (tables)       → 7 models
         │
